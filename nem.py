@@ -101,11 +101,11 @@ def set_up_optimizer(loss, optimizer, params, clip_gradients):
         'adadelta': tf.train.AdadeltaOptimizer,
         'adagrad': tf.train.AdagradOptimizer,
         'rmsprop': tf.train.RMSPropOptimizer
-    }[optimizer](**params)
+    }[optimizer](**params)  # params: learning_rate': 0.001
 
     # optionally clip gradients by norm
     grads_and_vars = opt.compute_gradients(loss)
-    if clip_gradients is not None:
+    if clip_gradients is not None: # clip_gradients=none
         grads_and_vars = [(tf.clip_by_norm(grad, clip_gradients), var)
                           for grad, var in grads_and_vars]
 
@@ -320,7 +320,7 @@ def run_from_file(run_config, nem, log_dir, seed, net_path=None):
 
 
 @ex.automain
-def run(net_path, training, validation, nem, seed, log_dir, _run):
+def run(net_path, training, validation, nem, seed, log_dir, _run):  # #944371721 is fixed seed?
 
     # clear debug dir
     if log_dir and net_path is None:

@@ -115,7 +115,7 @@ class NEMCell(RNNCell):
 
             return rnn_inputs * gamma  # implicitly broadcasts over C
 
-    def run_inner_rnn(self, masked_deltas, h_old):
+    def run_inner_rnn(self, masked_deltas, h_old, input_data):
         with tf.name_scope('reshape_masked_deltas'):
             shape = tf.shape(masked_deltas)
             # print(masked_deltas.get_shape())
@@ -124,8 +124,13 @@ class NEMCell(RNNCell):
             M = np.prod(self.input_shape.as_list())
             reshaped_masked_deltas = tf.reshape(masked_deltas, tf.stack([batch_size * K, M]))
 
-        preds, h_new = self.cell(reshaped_masked_deltas, h_old)
+        preds, h_new = self.cell((reshaped_masked_deltas, input_data), h_old) # add input_data as context
+        # preds, h_new = self.cell(reshaped_masked_deltas, h_old)
 
+        # kkk = tf.reshape(preds, shape=shape)
+        # print(kkk[0])
+        # print(kkk[1])
+        # assert kkk[0]==kkk[1]
         return tf.reshape(preds, shape=shape), h_new
 
     def compute_em_probabilities(self, predictions, data, epsilon=1e-6):
@@ -177,7 +182,7 @@ class NEMCell(RNNCell):
         masked_deltas = self.mask_rnn_inputs(deltas, gamma_old)
 
         # compute new predictions
-        preds, h_new = self.run_inner_rnn(masked_deltas, h_old)
+        preds, h_new = self.run_inner_rnn(masked_deltas, h_old, input_data)
 
         # compute the new gammas
         gamma = self.e_step(preds, target_data)

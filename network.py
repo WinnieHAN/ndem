@@ -326,6 +326,56 @@ class NEMOutputWrapper(RNNCell):
         return projected, res_state
 
 
+class NEMOutputDiscriWrapper(RNNCell):
+    def __init__(self, cell, size, weight_path, name="NEMOutputDiscriWrapper"):
+        self._cell = cell
+        self._size = size
+        self._weight_path = weight_path
+        self._name = name
+
+    @property
+    def state_size(self):
+        return self._cell.state_size
+
+    @property
+    def output_size(self):
+        return self._size
+
+    def __call__(self, inputs_and_context, state, scope=None):
+        inputs, context = inputs_and_context
+        # print('context: ', tf.shape(context))
+        # print('inputs', tf.shape(inputs))
+        # print('state', tf.shape(state))
+        output, res_state = self._cell(inputs, state)  # output = sigmoid(W*sigmoid(theta))  res_state=theta
+
+        with tf.variable_scope("multi_rnn_cell/cell_0/EMCell_discri/input_discri"):  # , reuse=True
+            # W_t = tf.transpose(tf.get_variable("weights"))  ??
+            input_layer = tf.reshape(output, [-1, 28, 28, 1])
+            conv1 = tf.layers.conv2d(
+                inputs=input_layer,
+                filters=32,
+                kernel_size=[5, 5],
+                padding="same",
+                activation=tf.nn.relu)
+            pool1 = tf.layers.max_pooling2d(inputs=conv1, pool_size=[2, 2], strides=2)
+            conv2 = tf.layers.conv2d(
+                inputs=pool1,
+                filters=64,
+                kernel_size=[5, 5],
+                padding="same",
+                activation=tf.nn.relu)
+            pool2 = tf.layers.max_pooling2d(inputs=conv2, pool_size=[2, 2], strides=2)
+            pool2_flat = tf.reshape(pool2, [-1, 7 * 7 * 64])
+            dense1 = tf.layers.dense(inputs=pool2_flat, units=10, activation=tf.nn.relu)
+            dense2 = tf.layers.dense(inputs=dense1, units=784, activation=tf.nn.relu)
+            dropout = tf.layers.dropout(
+                inputs=dense2, rate=0.5) # , training=mode == tf.estimator.ModeKeys.TRAIN
+        projected = output + dropout
+
+        # projected = tf.matmul(output, W_t)
+
+        return projected, res_state  # projected = output+cnn(context)
+
 # NETWORK BUILDER
 
 
@@ -339,7 +389,11 @@ def build_network(out_size, output_dist, input, recurrent, output, use_NEM_formu
             cell = tf.contrib.rnn.MultiRNNCell([cell])
 
             cell = NEMOutputWrapper(cell, out_size, "multi_rnn_cell/cell_0/EMCell")
+            print('++++++++++++++++++++++++++++++++')
+            print(output[0]['act'])
             cell = ActivationFunctionWrapper(cell, output[0]['act'])
+            # DEBUG
+            cell = NEMOutputDiscriWrapper(cell, out_size, "multi_rnn_cell/cell_0/EMCell_discri")
 
             return cell
 
