@@ -54,3 +54,9 @@ debug_out/
 MNIST-data/
 __pycache__
 *.pyc
+debug_out_nem_1/
+debug_out_nem_2/
+debug_out_rnn_1/
+debug_out_rnn_2/
+temp.py
+temp2.py
