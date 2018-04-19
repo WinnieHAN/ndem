@@ -115,7 +115,7 @@ class NEMCell(RNNCell):
 
             return rnn_inputs * gamma  # implicitly broadcasts over C
 
-    def run_inner_rnn(self, masked_deltas, h_old, input_data):
+    def run_inner_rnn(self, masked_deltas, h_old, input_data, context_weight, klloss_weight):
         with tf.name_scope('reshape_masked_deltas'):
             shape = tf.shape(masked_deltas)
             # print(masked_deltas.get_shape())
@@ -124,14 +124,15 @@ class NEMCell(RNNCell):
             M = np.prod(self.input_shape.as_list())
             reshaped_masked_deltas = tf.reshape(masked_deltas, tf.stack([batch_size * K, M]))
 
-        preds, h_new = self.cell((reshaped_masked_deltas, input_data), h_old) # add input_data as context
+        preds_varloss, h_new = self.cell((reshaped_masked_deltas, input_data, context_weight, klloss_weight), h_old) # add input_data as context
+        (preds, varitional_loss) = preds_varloss
         # preds, h_new = self.cell(reshaped_masked_deltas, h_old)
 
         # kkk = tf.reshape(preds, shape=shape)
         # print(kkk[0])
         # print(kkk[1])
         # assert kkk[0]==kkk[1]
-        return tf.reshape(preds, shape=shape), h_new
+        return (tf.reshape(preds, shape=shape), varitional_loss), h_new
 
     def compute_em_probabilities(self, predictions, data, epsilon=1e-6):
         """Compute pixelwise probability of predictions (wrt. the data).
@@ -172,7 +173,7 @@ class NEMCell(RNNCell):
 
     def __call__(self, inputs, state, scope=None):
         # unpack
-        input_data, target_data = inputs
+        input_data, target_data, context_weight, klloss_weight = inputs
         h_old, preds_old, gamma_old = state
 
         # compute difference between prediction and input
@@ -182,14 +183,15 @@ class NEMCell(RNNCell):
         masked_deltas = self.mask_rnn_inputs(deltas, gamma_old)
 
         # compute new predictions
-        preds, h_new = self.run_inner_rnn(masked_deltas, h_old, input_data)
-
+        preds_vaeloss, h_new = self.run_inner_rnn(masked_deltas, h_old, input_data, context_weight, klloss_weight) # input_data is 'x' which has noisees.
+        (preds, varitional_loss) = preds_vaeloss
         # compute the new gammas
         gamma = self.e_step(preds, target_data)
 
         # pack and return
-        outputs = (h_new, preds, gamma)
-        return outputs, outputs
+        outputs = (h_new, preds, gamma, varitional_loss)
+        outputs_no_varloss = (h_new, preds, gamma)
+        return outputs, outputs_no_varloss
 
 
 @nem.capture
@@ -318,17 +320,19 @@ def static_nem_iterations(input_data, target_data, binary, k):
 
     # build static iterations
     outputs = [hidden_state]
-    total_losses, upper_bound_losses, other_losses = [], [], []
+    total_losses, upper_bound_losses, other_losses, varitional_losses = [], [], [], []
     loss_step_weights = get_loss_step_weights()
-
+    with tf.variable_scope("context_and_klloss_weight", reuse=True):
+        context_weight = tf.get_variable(name='context_weight')
+        klloss_weight = tf.get_variable(name='klloss_weight')
     with tf.variable_scope('NEM') as varscope:
         for t, loss_weight in enumerate(loss_step_weights):
             varscope.reuse_variables() if t > 0 else None       # share weights across time
             with tf.name_scope('step_{}'.format(t)):
                 # run nem cell
-                inputs = (input_data[t], target_data[t+1])
-                hidden_state, output = nem_cell(inputs, hidden_state)
-                theta, pred, gamma = output
+                inputs = (input_data[t], target_data[t+1], context_weight, klloss_weight)
+                output, hidden_state = nem_cell(inputs, hidden_state)
+                theta, pred, gamma, variational_loss = output
 
                 # compute nem losses
                 total_loss, intra_loss, inter_loss = compute_outer_loss(
@@ -336,7 +340,7 @@ def static_nem_iterations(input_data, target_data, binary, k):
 
                 # compute estimated loss upper bound (which doesn't use E-step)
                 loss_upper_bound = compute_loss_upper_bound(pred, target_data[t+1], pixel_dist)
-
+            varitional_losses.append(loss_weight * variational_loss)
             total_losses.append(loss_weight * total_loss)
             upper_bound_losses.append(loss_upper_bound)
             other_losses.append(tf.stack([total_loss, intra_loss, inter_loss]))
@@ -352,5 +356,5 @@ def static_nem_iterations(input_data, target_data, binary, k):
         upper_bound_losses = tf.stack(upper_bound_losses)  # (T,)
     with tf.name_scope('total_loss'):
         total_loss = tf.reduce_sum(tf.stack(total_losses))
-    return total_loss, thetas, preds, gammas, other_losses, upper_bound_losses
+    return total_loss, thetas, preds, gammas, other_losses, upper_bound_losses, variational_loss
 

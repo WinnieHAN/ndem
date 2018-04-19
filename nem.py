@@ -94,6 +94,8 @@ def add_noise(data, noise, dataset):
 
 @ex.capture(prefix='training')
 def set_up_optimizer(loss, optimizer, params, clip_gradients):
+    params = {'learning_rate': 0.0001}
+    clip_gradients = 10
     opt = {
         'adam': tf.train.AdamOptimizer,
         'sgd': tf.train.GradientDescentOptimizer,
@@ -112,16 +114,45 @@ def set_up_optimizer(loss, optimizer, params, clip_gradients):
     return opt, opt.apply_gradients(grads_and_vars)
 
 
+def set_up_discri_optimizer(loss):
+    params = {'learning_rate': 0.0001}
+    optimizer = 'adam'
+    clip_gradients = 10
+    opt = {
+        'adam': tf.train.AdamOptimizer,
+        'sgd': tf.train.GradientDescentOptimizer,
+        'momentum': tf.train.MomentumOptimizer,
+        'adadelta': tf.train.AdadeltaOptimizer,
+        'adagrad': tf.train.AdagradOptimizer,
+        'rmsprop': tf.train.RMSPropOptimizer
+    }[optimizer](**params)  # params: learning_rate': 0.001  params={learning_rate': 0.001}
+
+    # optionally clip gradients by norm
+    grads_and_vars = opt.compute_gradients(loss)
+    if clip_gradients is not None: # clip_gradients=none
+        grads_and_vars1 = []
+        # grads_and_vars = [(tf.clip_by_norm(grad, clip_gradients), var)
+        #                   for grad, var in grads_and_vars if not grad==None else (grad, var)]
+        for grad, var in grads_and_vars:
+            if grad is not None :
+                grads_and_vars1.append((tf.clip_by_norm(grad, clip_gradients), var))
+            else:
+                grads_and_vars1.append((grad, var))
+
+    return opt, opt.apply_gradients(grads_and_vars1)
+
+
 @ex.capture
 def build_graph(features, groups, dataset):
     features_corrupted = add_noise(features)
-    loss, thetas, preds, gammas, other_losses, upper_bound_losses = \
+    loss, thetas, preds, gammas, other_losses, upper_bound_losses, variational_loss = \
         static_nem_iterations(features_corrupted, features, dataset['binary'])
     graph = {
         'inputs': features,
         'groups': groups,
         'corrupted': features_corrupted,
         'loss': loss,
+        'variational_loss': variational_loss,
         'gammas': gammas,
         'thetas': thetas,
         'preds': preds,
@@ -151,6 +182,7 @@ def build_graphs(train_inputs, valid_inputs):
     with tf.name_scope("train"):
         train_graph = build_graph(train_inputs['features'], train_inputs['groups'])
         opt, train_op = set_up_optimizer(train_graph['loss'])
+        opt_v, train_op_v = set_up_discri_optimizer(train_graph['variational_loss'])
 
     varscope.reuse_variables()
     with tf.name_scope("valid"):
@@ -158,7 +190,7 @@ def build_graphs(train_inputs, valid_inputs):
 
     debug_graph = build_debug_graph(valid_inputs)
 
-    return train_op, train_graph, valid_graph, debug_graph
+    return train_op, train_op_v, train_graph, valid_graph, debug_graph
 
 
 @ex.capture
@@ -190,26 +222,28 @@ def populate_debug_out(session, debug_graph, pipe_line, debug_samples, name):
     create_debug_plots(name, debug_out, debug_data['groups'], idxs)
 
 
-def run_epoch(session, pipe_line, graph, debug_graph, debug_samples, debug_name, train_op=None):
-    fetches = [graph['loss'], graph['other_losses'], graph['ARI'], graph['upper_bound_losses']]
+def run_epoch(session, pipe_line, graph, debug_graph, debug_samples, debug_name, train_op=None, train_op_v=None):
+    fetches = [graph['loss'], graph['other_losses'], graph['ARI'], graph['upper_bound_losses'], graph['variational_loss']]
     fetches.append(train_op) if train_op is not None else None
+    fetches.append(train_op_v) if train_op_v is not None else None
 
-    losses, others, ari_scores, ub_losses = [], [], [], []
+    losses, others, ari_scores, ub_losses, variational_losses = [], [], [], [], []
     # run through the epoch
     for b in range(pipe_line.get_n_batches()):
         # run batch
         out = session.run(fetches)
-
         # log out
         losses.append(out[0])
         others.append(out[1])
         ari_scores.append(out[2])
         ub_losses.append(out[3])
+        variational_losses.append(out[4])
 
     if debug_samples is not None:
         populate_debug_out(session, debug_graph, pipe_line, debug_samples, debug_name)
 
-    return float(np.mean(losses)), np.mean(others, axis=0), np.mean(ari_scores, axis=0), float(np.mean(ub_losses, axis=0)[-1])
+    return float(np.mean(losses)), np.mean(others, axis=0), np.mean(ari_scores, axis=0), \
+           float(np.mean(ub_losses, axis=0)[-1]), float(np.mean(variational_losses))
 
 
 @ex.capture
@@ -277,7 +311,7 @@ def run_from_file(run_config, nem, log_dir, seed, net_path=None):
         inputs = InputPipeLine(usage, shuffle=False, sequence_length=nr_steps, batch_size=run_config['batch_size'])
 
         # Build Graph
-        _, _, graph, debug_graph = build_graphs(inputs.output, inputs.output)
+        _, _, _, graph, debug_graph = build_graphs(inputs.output, inputs.output)
 
         t = time.time()
         with tf.Session(graph=g) as session:
@@ -321,7 +355,9 @@ def run_from_file(run_config, nem, log_dir, seed, net_path=None):
 
 @ex.automain
 def run(net_path, training, validation, nem, seed, log_dir, _run):  # #944371721 is fixed seed?
-
+    # seed = 944371721  # or 1 (-0 -0 0.1 0.4)
+    # tf.set_random_seed(seed)
+    print('seed: ', seed)
     # clear debug dir
     if log_dir and net_path is None:
         utils.create_directory(log_dir)
@@ -331,16 +367,20 @@ def run(net_path, training, validation, nem, seed, log_dir, _run):  # #944371721
     nr_iters = nem['nr_steps'] + 1
     train_inputs = InputPipeLine('training', shuffle=True, sequence_length=nr_iters, batch_size=training['batch_size'])
     valid_inputs = InputPipeLine('validation', shuffle=False, sequence_length=nr_iters, batch_size=validation['batch_size'])
-
+    # Set Weigth
+    with tf.variable_scope("context_and_klloss_weight"):
+        context_weight = tf.get_variable(name='context_weight', dtype=tf.float32, trainable=False, initializer=0.0)
+        klloss_weight = tf.get_variable(name='klloss_weight', dtype=tf.float32, trainable=False, initializer=0.0)
     # Build Graph
-    train_op, train_graph, valid_graph, debug_graph = build_graphs(train_inputs.output, valid_inputs.output)
+    train_op, train_op_v, train_graph, valid_graph, debug_graph = build_graphs(train_inputs.output, valid_inputs.output)
     init = tf.global_variables_initializer()
 
     # print vars
     utils.print_vars(tf.trainable_variables())
+    utils.print_vars(tf.global_variables())
 
     with tf.Session() as session:
-        tf.set_random_seed(seed)
+
 
         # continue training from net_path if specified.
         saver = tf.train.Saver()
@@ -363,10 +403,38 @@ def run(net_path, training, validation, nem, seed, log_dir, _run):  # #944371721
         for epoch in range(1, training['max_epoch'] + 1):
 
             t = time.time()
-            train_loss, others, train_scores, train_ub_loss_last = run_epoch(
+            if epoch < 20:  # 5 for em , 20 for rnn-em
+                update_context_weight = tf.assign(context_weight, 0.)
+                update_klloss_weight = tf.assign(klloss_weight, 0.)
+                train_op_v = None
+            else:
+                update_context_weight = tf.assign(context_weight, 1.)
+                update_klloss_weight = tf.assign(klloss_weight, 1.)
+            session.run(update_context_weight)
+            session.run(update_klloss_weight)
+            #  ---------------
+            print('klloss_weight before: ', session.run(klloss_weight))
+            weight = tf.get_variable(name='NEM/multi_rnn_cell/cell_0/EMCell_discri/input_discri/fully_connected_2/weights')
+            weight = tf.Print(weight, ['-----------------', weight])
+            # session.run(weight)
+            print(weight.eval()[:,0])
+            #  ---------------------
+            train_loss, others, train_scores, train_ub_loss_last, train_variational_loss = run_epoch(
                 session, train_inputs, train_graph, debug_graph, training['debug_samples'], "train_e{}".format(epoch),
-                train_op=train_op)
-
+                train_op=train_op, train_op_v=train_op_v)
+            #  ---------------------
+            print('klloss_weight after: ', session.run(klloss_weight))
+            weight = tf.get_variable(name='NEM/multi_rnn_cell/cell_0/EMCell_discri/input_discri/fully_connected_2/weights')
+            weight = tf.Print(weight, ['-----------------', weight])
+            session.run(weight)
+            print(weight.eval()[:,0])
+            #  -------------------
+            #  ---------------------
+            # weight = tf.get_variable(name='train/NEM/step_14/multi_rnn_cell/cell_0/EMCell_discri/input_discri/weighted_context')
+            # weight = tf.Print(weight, ['-----------------', weight])
+            # session.run(weight)
+            # print(weight.eval()[:,0])
+            #  -------------------
             add_log('training.loss', train_loss)
             add_log('training.others', others)
             add_log('training.score', train_scores[0])
@@ -379,9 +447,11 @@ def run(net_path, training, validation, nem, seed, log_dir, _run):  # #944371721
                   (epoch, train_loss, train_scores[0], train_scores[2], train_scores[1], train_scores[3], time.time() - t))
             print("    Other Train Losses:      ({})".format(", ".join(["%.2f" % o for o in others.mean(0)])))
             print("    Train Loss UB last: %.2f" % train_ub_loss_last)
+            # print("    Train Loss including variational loss--final loss: %.2f" % train_loss+train_variational_loss)
+            print('    Train Variatioanl Los:', train_variational_loss)
 
             t = time.time()
-            valid_loss, others, valid_scores, valid_ub_loss_last = run_epoch(
+            valid_loss, others, valid_scores, valid_ub_loss_last, valid_variational_loss = run_epoch(
                 session, valid_inputs, valid_graph, debug_graph, validation['debug_samples'], "valid_e{}".format(epoch))
 
             # valid_scores = seq_ARI, last_ARI, seq_conf, last_conf
@@ -399,6 +469,8 @@ def run(net_path, training, validation, nem, seed, log_dir, _run):  # #944371721
                   (valid_loss, valid_scores[0], valid_scores[2], valid_scores[1], valid_scores[3], time.time() - t))
             print("    Other Validation Losses: ({})".format(", ".join(["%.2f" % o for o in others.mean(0)])))
             print("    Valid Loss UB last: %.2f" % valid_ub_loss_last)
+            print("    Valid Variational Loss:", valid_variational_loss)
+
 
             if valid_loss < best_valid_loss:
                 best_valid_loss = valid_loss
@@ -417,7 +489,8 @@ def run(net_path, training, validation, nem, seed, log_dir, _run):  # #944371721
 
             if np.isnan(valid_loss):
                 print('Early Stopping because validation loss is nan')
-                break
+                pass
+                # break
 
         # shutdown everything to avoid zombies
         coord.request_stop()

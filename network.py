@@ -10,6 +10,8 @@ from sacred import Ingredient
 from tensorflow.contrib.rnn import RNNCell
 from utils import ACTIVATION_FUNCTIONS
 
+import numpy as np
+
 net = Ingredient('network')
 
 
@@ -23,6 +25,7 @@ def cfg():
     output = [
         {'name': 'fc', 'size': 784, 'act': '*', 'ln': False},
     ]
+
 
 
 net.add_named_config('flying_mnist', {
@@ -77,7 +80,11 @@ net.add_named_config('shapes', {
     ],
     'output': [
         {'name': 'fc', 'size': 784, 'act': '*', 'ln': False}
-    ]})
+    ]
+    # 'discriminative': [
+    #     {'s_hidden_dim': 10}
+    # ]
+})
 
 
 net.add_named_config('NEM', {
@@ -332,6 +339,8 @@ class NEMOutputDiscriWrapper(RNNCell):
         self._size = size
         self._weight_path = weight_path
         self._name = name
+        self.lambda_v = 0
+        self.lambda_vs = [1.0 for i in range(20)] + [i/11.0 for i in range(11)]
 
     @property
     def state_size(self):
@@ -341,44 +350,238 @@ class NEMOutputDiscriWrapper(RNNCell):
     def output_size(self):
         return self._size
 
-    def __call__(self, inputs_and_context, state, scope=None):
-        # print('+++++++++++++++++++++++++++++++++++')
-        inputs, context = inputs_and_context
-        # print('context: ', tf.shape(context))
-        # print('inputs', tf.shape(inputs))
-        # print('state', tf.shape(state))
-        output, res_state = self._cell(inputs, state)  # output = sigmoid(W*sigmoid(theta))  res_state=theta
+    def inference_network(self, x, latent_dim):
+        """Construct an inference network parametrizing a Gaussian.
+           Ref: https://github.com/altosaar/variational-autoencoder.git
 
-        with tf.variable_scope("multi_rnn_cell/cell_0/EMCell_discri/input_discri"):  # , reuse=True
-            # W_t = tf.transpose(tf.get_variable("weights"))  ??
-            input_layer = tf.reshape(context, [-1, 28, 28, 1])
-            conv1 = tf.layers.conv2d(
+        Args:
+          x: A batch of pictures.
+          latent_dim: The latent dimensionality.
+          hidden_size: The size of the neural net hidden layers.
+
+        Returns:
+          mu: Mean parameters for the variational family Normal
+          sigma: Standard deviation parameters for the variational family Normal
+        """
+        with slim.arg_scope([slim.fully_connected], activation_fn=tf.nn.relu):
+            input_layer = tf.reshape(x, [-1, 28, 28, 1])
+            conv1 = slim.layers.conv2d(
                 inputs=input_layer,
-                filters=32,
+                num_outputs=32,
                 kernel_size=[5, 5],
                 padding="same",
-                activation=tf.nn.relu)
-            pool1 = tf.layers.max_pooling2d(inputs=conv1, pool_size=[2, 2], strides=2)
-            conv2 = tf.layers.conv2d(
+                activation_fn=tf.nn.relu)
+            pool1 = slim.layers.max_pool2d(inputs=conv1, kernel_size=[2, 2], stride=[2,2])
+            conv2 = slim.layers.conv2d(
                 inputs=pool1,
-                filters=64,
+                num_outputs=64,
                 kernel_size=[5, 5],
                 padding="same",
-                activation=tf.nn.relu)
-            pool2 = tf.layers.max_pooling2d(inputs=conv2, pool_size=[2, 2], strides=2)
+                activation_fn=tf.nn.relu)
+            pool2 = slim.layers.max_pool2d(inputs=conv2, kernel_size=[2, 2], stride=[2,2])
             pool2_flat = tf.reshape(pool2, [-1, 7 * 7 * 64])
-            dense1 = tf.layers.dense(inputs=pool2_flat, units=10, activation=tf.nn.relu)
-            dense2 = tf.layers.dense(inputs=dense1, units=784*3, activation=tf.nn.relu)
-            # dense2 = tf.layers.dense(inputs=dense1, units=784, activation=tf.nn.relu)
-            dropout = tf.layers.dropout(
-                inputs=dense2, rate=0.5) # , training=mode == tf.estimator.ModeKeys.TRAIN
-            out_context = tf.reshape(dropout, [-1, 784])
-        projected = output + out_context
-        # projected = output + dropout
+            dense1 = slim.layers.fully_connected(inputs=pool2_flat, num_outputs=latent_dim*2, activation_fn=tf.nn.relu)
+            mu = dense1[:, :latent_dim]
+            sigma = tf.nn.softplus(dense1[:, latent_dim:])
+            q_s = tf.distributions.Normal(loc=mu, scale=sigma)
+            q_s_sample = q_s.sample()
+            dense2 = slim.layers.fully_connected(inputs=q_s_sample, num_outputs=784 * 3, activation_fn=tf.nn.relu)  # k=3
+            # dropout = tf.layers.dropout(inputs=dense2, rate=0.5)  # , training=mode == tf.estimator.ModeKeys.TRAIN
+            out_context = tf.reshape(dense2, [-1, 784])
+        # with slim.arg_scope([slim.fully_connected], activation_fn=tf.nn.relu, reuse=True):
+        #     #  for check given s
+        #     s_input = tf.placeholder(tf.float32, [None, latent_dim])
+        #     dense2 = slim.layers.fully_connected(inputs=s_input, num_outputs=784 * 3, activation_fn=tf.nn.relu)
+        #     out_context = tf.reshape(dense2, [-1, 784])
+        return q_s, out_context
 
-        # projected = tf.matmul(output, W_t)
+    def __call__(self, inputs_and_context_ctxtw_klw, state, scope=None):
+        # print('+++++++++++++++++++++++++++++++++++')
+        inputs, context, context_weight, klloss_weight = inputs_and_context_ctxtw_klw
+        output, res_state = self._cell(inputs, state)  # output = sigmoid(W*sigmoid(theta))  res_state=theta
+        # context_weight.trainable = False
+        # context_weight.name = 'context_weight1'
+        # klloss_weight.trainable = False
+        # klloss_weight = tf.identity(klloss_weight, name='klloss_weight1')
 
-        return projected, res_state  # projected = output+cnn(context)
+        # print('name: ', context_weight.name)
+
+        anti_overfit_type = 'variational_2' # 'dropout', 'denoising'
+        # with tf.variable_scope('context_and_klloss_weight', reuse=True):
+        #     context_weight2 = tf.get_variable(name='context_weight222', shape=[1], dtype=tf.float32)
+        #     klloss_weight = tf.get_variable(name='klloss_weight', shape=[1], dtype=tf.float32)
+
+        if anti_overfit_type == 'variational_2':
+            with tf.variable_scope("multi_rnn_cell/cell_0/EMCell_discri/input_discri"):
+                latent_s_dim = 10
+
+                input_layer = tf.reshape(context, [-1, 28, 28, 1])
+                conv1 = slim.layers.conv2d(
+                    inputs=input_layer,
+                    num_outputs=32,
+                    kernel_size=[5, 5],
+                    padding="same",
+                    activation_fn=tf.nn.relu)
+                pool1 = slim.layers.max_pool2d(inputs=conv1, kernel_size=[2, 2], stride=[2, 2])
+                conv2 = slim.layers.conv2d(
+                    inputs=pool1,
+                    num_outputs=64,
+                    kernel_size=[5, 5],
+                    padding="same",
+                    activation_fn=tf.nn.relu)
+                pool2 = slim.layers.max_pool2d(inputs=conv2, kernel_size=[2, 2], stride=[2, 2])
+                pool2_flat = tf.reshape(pool2, [-1, 7 * 7 * 64])
+                s_mu = slim.layers.fully_connected(inputs=pool2_flat, num_outputs=latent_s_dim,
+                                                     # activation_fn=tf.nn.relu,
+                                                     weights_regularizer=slim.l2_regularizer(scale=0.1),
+                                                     biases_regularizer=slim.l2_regularizer(scale=0.1)
+                                                     )
+                s_logvar = slim.layers.fully_connected(inputs=pool2_flat, num_outputs=latent_s_dim,
+                                                     # activation_fn=tf.nn.relu,
+                                                     weights_regularizer=slim.l2_regularizer(scale=0.1),
+                                                     biases_regularizer=slim.l2_regularizer(scale=0.1)
+                                                     )
+                kltype = 1
+                if kltype==1:
+                    eps = tf.random_normal(shape=tf.shape(s_mu))
+                    q_s_sample = s_mu + tf.exp(s_logvar / 2) * eps
+                    kl = 0.5 * tf.reduce_sum(tf.exp(s_logvar) + s_mu ** 2 - 1. - s_logvar, 1)
+                else:
+                    q_s = tf.distributions.Normal(loc=s_mu, scale=tf.exp(s_logvar))
+                    # assert q_s.reparameterization_type == tf.distributions.FULLY_REPARAMETERIZED
+                    q_s_sample = q_s.sample()
+                    p_s = tf.distributions.Normal(loc=np.zeros(latent_s_dim, dtype=np.float32),
+                                                  scale=np.ones(latent_s_dim, dtype=np.float32))
+                    kl = tf.reduce_sum(tf.distributions.kl_divergence(q_s, p_s), 1) # minimize it.
+
+                self.lambda_v = self.lambda_v + 1
+                # print('self.lambda_vs[self.lambda_v]:  ', self.lambda_vs[self.lambda_v])
+                # print('self.lambda_v: ', self.lambda_v)
+                variational_loss = tf.reduce_sum(kl, 0)* klloss_weight
+                # variational_loss = tf.reduce_sum(kl, 0) * self.lambda_vs[self.lambda_v]
+                # variational_loss = tf.Variable(0, dtype='float32')
+                dense2 = slim.layers.fully_connected(inputs=q_s_sample, num_outputs=784 * 3,
+                                                     # activation_fn=tf.nn.relu,
+                                                     weights_regularizer=slim.l2_regularizer(scale=0.1),
+                                                     biases_regularizer=slim.l2_regularizer(scale=0.1)
+                                                     )  # k=3
+                # dropout = tf.layers.dropout(inputs=dense2, rate=0.5)  # , training=mode == tf.estimator.ModeKeys.TRAIN
+                out_context = tf.reshape(dense2, [-1, 784])
+                # out_context = slim.layers.dropout(inputs=out_context, keep_prob=0.5)  # dropout correct
+                # print(out_context)
+
+                # train_op = optimizer.minimize(elbo)
+
+            # context_weight = tf.Print(context_weight, [context_weight])
+            # tf.Session().run(context_weight)
+            # print(context_weight.eval())
+                weighted_context = out_context *context_weight
+                weighted_context =tf.identity(weighted_context, name='weighted_context')
+                print(weighted_context.name)
+            projected = output + weighted_context  # q_s_sample.size() = batch_size * latent_dim
+        elif anti_overfit_type == 'variational':
+            with tf.variable_scope("multi_rnn_cell/cell_0/EMCell_discri/input_discri"):
+                latent_s_dim = 10
+
+                input_layer = tf.reshape(context, [-1, 28, 28, 1])
+                conv1 = slim.layers.conv2d(
+                    inputs=input_layer,
+                    num_outputs=32,
+                    kernel_size=[5, 5],
+                    padding="same",
+                    activation_fn=tf.nn.relu)
+                pool1 = slim.layers.max_pool2d(inputs=conv1, kernel_size=[2, 2], stride=[2, 2])
+                conv2 = slim.layers.conv2d(
+                    inputs=pool1,
+                    num_outputs=64,
+                    kernel_size=[5, 5],
+                    padding="same",
+                    activation_fn=tf.nn.relu)
+                pool2 = slim.layers.max_pool2d(inputs=conv2, kernel_size=[2, 2], stride=[2, 2])
+                pool2_flat = tf.reshape(pool2, [-1, 7 * 7 * 64])
+                dense1 = slim.layers.fully_connected(inputs=pool2_flat, num_outputs=latent_s_dim * 2,
+                                                     # activation_fn=tf.nn.relu,
+                                                     weights_regularizer=slim.l2_regularizer(scale=0.1),
+                                                     biases_regularizer=slim.l2_regularizer(scale=0.1)
+                                                     )
+                mu = dense1[:, :latent_s_dim]
+                sigma = tf.nn.softplus(dense1[:, latent_s_dim:])
+                q_s = tf.distributions.Normal(loc=mu, scale=sigma)
+                assert q_s.reparameterization_type == tf.distributions.FULLY_REPARAMETERIZED
+                q_s_sample = q_s.sample()
+                dense2 = slim.layers.fully_connected(inputs=q_s_sample, num_outputs=784 * 3,
+                                                     # activation_fn=tf.nn.relu,
+                                                     weights_regularizer=slim.l2_regularizer(scale=0.1),
+                                                     biases_regularizer=slim.l2_regularizer(scale=0.1))  # k=3
+                # dropout = tf.layers.dropout(inputs=dense2, rate=0.5)  # , training=mode == tf.estimator.ModeKeys.TRAIN
+                out_context = tf.reshape(dense2, [-1, 784])
+                # out_context = slim.layers.dropout(inputs=out_context, keep_prob=0.5)  # dropout correct
+                # debug
+                # q_s, out_context = self.inference_network(x=context, latent_dim=latent_s_dim)
+                p_s = tf.distributions.Normal(loc=np.zeros(latent_s_dim, dtype=np.float32),
+                                              scale=np.ones(latent_s_dim, dtype=np.float32))
+                kl = tf.reduce_sum(tf.distributions.kl_divergence(q_s, p_s), 1) # minimize it.
+                variational_loss = tf.reduce_sum(kl, 0)
+                # variational_loss = tf.Variable(0, dtype='float32')
+                print(out_context)
+
+                # train_op = optimizer.minimize(elbo)
+            projected = output + out_context  # q_s_sample.size() = batch_size * latent_dim
+        elif anti_overfit_type == 'dropout_with_slim':
+            with tf.variable_scope("multi_rnn_cell/cell_0/EMCell_discri/input_discri"):
+                input_layer = tf.reshape(context, [-1, 28, 28, 1])
+                conv1 = slim.layers.conv2d(
+                    inputs=input_layer,
+                    num_outputs=32,
+                    kernel_size=[5, 5],
+                    padding="same",
+                    activation_fn=tf.nn.relu)
+                pool1 = slim.layers.max_pool2d(inputs=conv1, kernel_size=[2, 2], stride=[2,2])
+                conv2 = slim.layers.conv2d(
+                    inputs=pool1,
+                    num_outputs=64,
+                    kernel_size=[5, 5],
+                    padding="same",
+                    activation_fn=tf.nn.relu)
+                pool2 = slim.layers.max_pool2d(inputs=conv2, kernel_size=[2, 2], stride=[2,2])
+                pool2_flat = tf.reshape(pool2, [-1, 7 * 7 * 64])
+                dense1 = slim.layers.fully_connected(inputs=pool2_flat, num_outputs=10, activation_fn=tf.nn.relu)
+                dense2 = slim.layers.fully_connected(inputs=dense1, num_outputs=784 * 3, activation_fn=tf.nn.relu)  # k=3
+                dropout = slim.layers.dropout(inputs=dense2, keep_prob=0.5)  # , training=mode == tf.estimator.ModeKeys.TRAIN
+                out_context = tf.reshape(dropout, [-1, 784])
+
+                variational_loss = tf.Variable(0, dtype='float32')
+
+            projected = output + out_context
+        elif anti_overfit_type == 'dropout':
+            with tf.variable_scope("multi_rnn_cell/cell_0/EMCell_discri/input_discri"):  # , reuse=True
+                # W_t = tf.transpose(tf.get_variable("weights"))  ??
+                input_layer = tf.reshape(context, [-1, 28, 28, 1])
+                conv1 = tf.layers.conv2d(
+                    inputs=input_layer,
+                    filters=32,
+                    kernel_size=[5, 5],
+                    padding="same",
+                    activation=tf.nn.relu)
+                pool1 = tf.layers.max_pooling2d(inputs=conv1, pool_size=[2, 2], strides=2)
+                conv2 = tf.layers.conv2d(
+                    inputs=pool1,
+                    filters=64,
+                    kernel_size=[5, 5],
+                    padding="same",
+                    activation=tf.nn.relu)
+                pool2 = tf.layers.max_pooling2d(inputs=conv2, pool_size=[2, 2], strides=2)
+                pool2_flat = tf.reshape(pool2, [-1, 7 * 7 * 64])
+                dense1 = tf.layers.dense(inputs=pool2_flat, units=10, activation=tf.nn.relu)
+                dense2 = tf.layers.dense(inputs=dense1, units=784*4, activation=tf.nn.relu)
+                # dense2 = tf.layers.dense(inputs=dense1, units=784, activation=tf.nn.relu)
+                dropout = tf.layers.dropout(
+                    inputs=dense2, rate=0.5) # , training=mode == tf.estimator.ModeKeys.TRAIN
+                out_context = tf.reshape(dropout, [-1, 784])
+            projected = output + out_context
+
+
+        return (projected, variational_loss), res_state  # projected = output+cnn(context)
 
 
 class NEMOutputNoneWrapper(RNNCell):
@@ -421,7 +624,7 @@ def build_network(out_size, output_dist, input, recurrent, output, use_NEM_formu
             # print(output[0]['act'])
             cell = ActivationFunctionWrapper(cell, output[0]['act'])
             # DEBUG
-            # cell = NEMOutputDiscriWrapper(cell, out_size, "multi_rnn_cell/cell_0/EMCell_discri")
+            cell = NEMOutputDiscriWrapper(cell, out_size, "multi_rnn_cell/cell_0/EMCell_discri")
 
             return cell
 

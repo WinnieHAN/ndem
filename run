@@ -1,0 +1,6 @@
+python nem.py with dataset.shapes network.NEM nem.k=3 nem.nr_steps=15 noise.prob=0.1
+python nem.py run_from_file with dataset.shapes network.NEM nem.k=3 nem.nr_steps=15 noise.prob=0.1  run_config.AMI=True
+
+python nem.py with dataset.shapes network.shapes nem.k=3 nem.nr_steps=15 noise.prob=0.1
+python nem.py run_from_file with dataset.shapes network.shapes nem.k=3 nem.nr_steps=15 noise.prob=0.1 run_config.AMI=True
+
